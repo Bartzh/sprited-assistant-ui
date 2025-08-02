@@ -199,7 +199,9 @@ export function Assistant() {
           openWhenHidden: true,
           method: 'GET',
           headers: {
-            "Authorization": `Bearer ${token}`
+            "Authorization": `Bearer ${token}`,
+            "Accept": "text/event-stream",
+            "Cache-Control": "no-cache"
           },
           onmessage(event) {
             if (event.event !== "message") {
