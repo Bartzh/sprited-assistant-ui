@@ -2,19 +2,25 @@ become-human的简单ui
 
 迟早要给它换了
 
+需要使用nginx，加入配置：
+
+```
+location / {
+    proxy_pass http://localhost:3000;
+}
+
+location /api {
+    proxy_pass http://localhost:36262;
+}
+```
+
 ---
 
 This is the [assistant-ui](https://github.com/Yonom/assistant-ui) starter project.
 
 ## Getting Started
 
-First, add your OpenAI API key to `.env.local` file:
-
-```
-OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-```
-
-Then, run the development server:
+Run the development server:
 
 ```bash
 npm run dev

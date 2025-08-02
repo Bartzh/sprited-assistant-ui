@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   useExternalStoreRuntime,
   ThreadMessageLike,
@@ -15,20 +15,33 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { Separator } from "@/components/ui/separator";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { Input } from "@/components/ui/input";
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+import { parse } from "path";
+class RetriableError extends Error { }
+class FatalError extends Error { }
 
 export function Assistant() {
   const [ currentThreadId, setCurrentThreadId ] = useState<string>("");
+  const currentThreadIdRef = useRef<string>(currentThreadId); // 使用ref来获取最新的值
+  const first_message_ref = useRef<boolean>(true);
+  const last_message_id_ref = useRef<string>("");
   const [threads, setThreads] = useState<Map<string, ThreadMessageLike[]>>(
     new Map()
   );
   const [threadList, setThreadList] = useState<ExternalStoreThreadData<"regular">[]>([]);
-  const [isRunning, setIsRunning] = useState<boolean>(false);
+  //const [isRunning, setIsRunning] = useState<boolean>(false);
 
-  const [userName, setUserName] = useState<string>("Mx4Ydpv8NFTdcpuS2P3w");
+  const [userName, setUserName] = useState<string>("system");
+  const system_regex = new RegExp("system", "i");
+
+  // 更新ref的值当state变化时
+  useEffect(() => {
+    currentThreadIdRef.current = currentThreadId;
+  }, [currentThreadId]);
 
   useEffect(() => {
-    if (userName !== "Mx4Ydpv8NFTdcpuS2P3w") {
-      localStorage.setItem("user_name", userName);
+    if (!system_regex.test(userName.trim())) {
+      localStorage.setItem("user_name", userName.trim());
     }
   }, [userName])
 
@@ -174,19 +187,122 @@ export function Assistant() {
           console.error("Initialization Error: ", error);
         }
       }
-      setUserName(localStorage.getItem("user_name") ?? "")
+      setUserName(localStorage.getItem("user_name") ?? "");
       fetchInitialThreads();
+      const fetchSSE = async () => {
+        const token = localStorage.getItem("token");
+        if (!token) return;
+        let first_message = true;
+        //let buffer = '';
+        let last_id = '';
+        await fetchEventSource('/api/sse', {
+          openWhenHidden: true,
+          method: 'GET',
+          headers: {
+            "Authorization": `Bearer ${token}`
+          },
+          onmessage(event) {
+            if (event.event !== "message") {
+              return;
+            }
+            const chunk = event.data;
+            // 在页面上显示消息
+            //buffer += chunk;
+            console.debug(chunk)
+            //const lines = buffer.split('\n');
+            if (chunk.trim()) {
+              try {
+                const parsedChunk = JSON.parse(chunk);
+                //buffer = '';
+                if (parsedChunk?.id !== undefined && parsedChunk?.id !== last_message_id_ref.current) {
+                  last_message_id_ref.current = parsedChunk?.id;
+                  first_message_ref.current = true;
+                }
+                if (parsedChunk.thread_id === currentThreadIdRef.current && (parsedChunk.name === "send_message" || parsedChunk.name === "log")) {
+                  setThreads(prev => {
+                    const next = new Map(prev);
+                    const current = next.get(currentThreadIdRef.current) || [];
+
+                    // 如果是新的助手消息
+                    if (first_message_ref.current) {
+                      //first_message_ref.current = false;
+                      return new Map(prev).set(currentThreadIdRef.current, [
+                        ...current,
+                        {
+                          role: "assistant",
+                          content: parsedChunk.args.message
+                        }
+                      ]);
+                    }
+                    else {
+                      // 只更新最后一条 role 为 assistant 的消息
+                      const lastAssistantMessageIndex = current.map((msg, index) => ({ msg, index }))
+                        .filter(({ msg }) => msg.role === "assistant")
+                        .pop()?.index;
+                      
+                      if (lastAssistantMessageIndex !== undefined) {
+                        const updatedCurrent = [...current];
+                        updatedCurrent[lastAssistantMessageIndex] = {
+                          ...updatedCurrent[lastAssistantMessageIndex],
+                          content: parsedChunk.args.message
+                        };
+                        return new Map(prev).set(currentThreadIdRef.current, updatedCurrent);
+                      }
+
+                      else {
+                        // 如果没有找到 assistant 消息，则添加新消息
+                        return new Map(prev).set(currentThreadIdRef.current, [
+                          ...current,
+                          {
+                            role: "assistant",
+                            content: parsedChunk.args.message
+                          }
+                        ]);
+                      }
+                    }
+                  });
+                  if (first_message_ref.current) {
+                    first_message_ref.current = false;
+                  }
+                  if (!(parsedChunk.not_completed ?? false)) {
+                    first_message_ref.current = true;
+                  }
+                }
+              } catch (e) {
+                //buffer = line;
+                console.warn('onmessage error: ', e);
+                //continue;
+              }
+            }
+          },
+          onclose() {
+            console.log('SSE connection closed');
+            // 正常关闭连接，等待一段时间后重连
+            setTimeout(() => {
+              throw new RetriableError();
+            }, 3000);
+          },
+          onerror(err) {
+            console.error('SSE error:', err);
+          }
+        });
+      }
+      fetchSSE();
     }, []); // 空依赖数组表示只在组件挂载时运行一次
 
     // 新增useEffect监听currentThreadId变化
     useEffect(() => {
-      if (currentThreadId && !threads.has(currentThreadId)) {
-        //console.debug("currentThreadId changed:", currentThreadId)
+      /*if (currentThreadId && !threads.has(currentThreadId)) {
+        fetchInitialMessages(currentThreadId);
+      }*/
+      if (currentThreadId) {
         fetchInitialMessages(currentThreadId);
       }
     }, [currentThreadId]);
 
   const onNew = async (message: AppendMessage) => {
+    const token = localStorage.getItem("token");
+    if (!token) return;
     // Add user message
     const userMessage: ThreadMessageLike = {
       role: "user",
@@ -200,14 +316,12 @@ export function Assistant() {
     });
 
     // Generate response
-    setIsRunning(true);
+    //setIsRunning(true);
 
-    const token = localStorage.getItem("token");
-    if (!token) return;
 
     try {
       // 发送HTTP请求
-      const response = await fetch("/api/stream", {
+      const response = await fetch("/api/input", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -215,7 +329,7 @@ export function Assistant() {
         },
         body: JSON.stringify({
           "message": message.content,
-          "user_name": localStorage.getItem("user_name"), // 使用输入的用户名
+          "user_name": localStorage.getItem("user_name"),
           "thread_id": currentThreadId
         }),
       });
@@ -223,9 +337,10 @@ export function Assistant() {
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
+    }
 
       // 创建一个ReadableStream来处理响应数据
-      const reader = response.body?.getReader();
+      /*const reader = response.body?.getReader();
 
       if (!reader) {
         throw new Error('Failed to get reader from response body');
@@ -292,7 +407,7 @@ export function Assistant() {
           }
         }
       }
-    } catch (error) {
+    } */catch (error) {
       console.error("Unexpected Error: ", error);
       const errorMessage: ThreadMessageLike = {
         role: "assistant",
@@ -304,9 +419,9 @@ export function Assistant() {
         next.set(currentThreadId, [...current, errorMessage]);
         return next;
       });
-    } finally {
+    }/* finally {
       setIsRunning(false);
-    }
+    }*/
   };
 
 
@@ -316,7 +431,7 @@ export function Assistant() {
     setMessages: (messages) => {
       setThreads((prev) => new Map(prev).set(currentThreadId, messages));
     },
-    isRunning,
+    //isRunning,
     onNew,
     convertMessage: (message) => message,
     adapters: {
