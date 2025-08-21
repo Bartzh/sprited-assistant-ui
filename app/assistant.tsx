@@ -190,7 +190,7 @@ export function Assistant() {
       setUserName(localStorage.getItem("user_name") ?? "");
       fetchInitialThreads();
       const fetchSSE = async () => {
-        const token = localStorage.getItem("token");
+        let token = localStorage.getItem("token");
         if (!token) return;
         let first_message = true;
         //let buffer = '';
@@ -202,6 +202,11 @@ export function Assistant() {
             "Authorization": `Bearer ${token}`,
             "Accept": "text/event-stream",
             "Cache-Control": "no-cache"
+          },
+          async onopen(response) {
+            if (response.status === 401) {
+              token = localStorage.getItem("token");
+            }
           },
           onmessage(event) {
             if (event.event !== "message") {
@@ -241,7 +246,7 @@ export function Assistant() {
                       const lastAssistantMessageIndex = current.map((msg, index) => ({ msg, index }))
                         .filter(({ msg }) => msg.role === "assistant")
                         .pop()?.index;
-                      
+
                       if (lastAssistantMessageIndex !== undefined) {
                         const updatedCurrent = [...current];
                         updatedCurrent[lastAssistantMessageIndex] = {
