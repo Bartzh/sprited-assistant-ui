@@ -15,8 +15,9 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { Separator } from "@/components/ui/separator";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Bell } from "lucide-react";
 import { fetchEventSource } from '@microsoft/fetch-event-source';
-import { parse } from "path";
 class RetriableError extends Error { }
 class FatalError extends Error { }
 
@@ -142,7 +143,7 @@ export function Assistant() {
       }
     },*/
   };
-    // 使用 useEffect 来加载初始消息
+    // 使用 useEffect 来完成初始化
     useEffect(() => {
       const fetchInitialThreads = async () => {
         const token = localStorage.getItem("token");
@@ -446,6 +447,59 @@ export function Assistant() {
     }
   });
 
+  async function registerServiceWorker() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      console.log('不支持 service worker 或 push manager');
+      return;
+    }
+
+    // 请求通知权限
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      console.log('用户拒绝通知权限');
+      return;
+    }
+
+    // 权限获取成功后再注册 Service Worker 和订阅
+    try {
+      let token = localStorage.getItem("token");
+      if (!token) return;
+
+      const appServerKeyRes = await fetch('/api/notification/key', {
+        method: 'GET',
+        headers: { "Authorization": `Bearer ${token}`, } 
+      }).then(res => res.json());
+      const appServerKey = appServerKeyRes.key;
+
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      console.log('SW registered:', registration);
+
+      // 检查现有订阅
+      const existingSubscription = await registration.pushManager.getSubscription();
+      if (existingSubscription) {
+        // 如果已有订阅，取消订阅。防止因key变更等原因无法推送通知（可以增加对比key是否有变更的判断，不过感觉没必要）
+        await existingSubscription.unsubscribe();
+        console.log('先取消现有订阅');
+      }
+
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: appServerKey,
+      });
+
+      console.log('Push subscription:', JSON.stringify(subscription));
+
+      // 发送给后端保存
+      await fetch('/api/notification/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', "Authorization": `Bearer ${token}` },
+        body: JSON.stringify(subscription),
+      });
+    } catch (err) {
+      console.error('SW or Push error:', err);
+    }
+  }
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SidebarProvider>
@@ -464,12 +518,22 @@ export function Assistant() {
                 <BreadcrumbSeparator className="hidden md:block" />
                 <BreadcrumbItem>
                   <Input
-                    placeholder="请设置用户名称"
+                    placeholder="你的名字"
                     value={userName}
                     //value={localStorage.getItem("user_name") ?? ""}
                     onChange={(e) => setUserName(e.target.value)}
                     //onChange={(e) => localStorage.setItem("user_name", e.target.value)}
                   />
+                </BreadcrumbItem>
+                <BreadcrumbItem>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={registerServiceWorker}
+                  >
+                    <Bell className="h-4 w-4" />
+                    <span className="sr-only">开启通知</span>
+                  </Button>
                 </BreadcrumbItem>
               </BreadcrumbList>
             </Breadcrumb>
