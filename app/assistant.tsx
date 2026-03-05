@@ -61,7 +61,7 @@ export function Assistant() {
           "Authorization": `Bearer ${token}`,
         },
         body: JSON.stringify({
-          "agent_id": threadId
+          "sprite_id": threadId
         }),
       });
 
@@ -150,7 +150,7 @@ export function Assistant() {
         if (!token) return;
 
         try {
-          const init_response = await fetch("/api/get_accessible_agents", {
+          const init_response = await fetch("/api/get_accessible_sprites", {
             method: "GET",
             headers: {
               "Authorization": `Bearer ${token}`,
@@ -166,7 +166,7 @@ export function Assistant() {
           // 将后端返回的 thread_id 列表转换为 threads Map 结构，每个 thread_id 对应一个空数组
           const newThreads = new Map<string, ThreadMessageLike[]>();
           const newTHreadsList: ExternalStoreThreadData<"regular">[] = [];
-          init_data.accessible_agents.forEach((threadId: string) => {
+          init_data.accessible_sprites.forEach((threadId: string) => {
             newThreads.set(threadId, []);
             newTHreadsList.push({
               "threadId": threadId,
@@ -179,9 +179,9 @@ export function Assistant() {
           setThreadList(newTHreadsList);
           //setThreads(newThreads);
           // 设置当前线程 ID 为最后一个可访问线程（如果存在）
-          if (init_data.accessible_agents.length > 0) {
-            setCurrentThreadId(init_data.accessible_agents[0]);
-            //await fetchInitialMessages(init_data.accessible_agents[0]);
+          if (init_data.accessible_sprites.length > 0) {
+            setCurrentThreadId(init_data.accessible_sprites[0]);
+            //await fetchInitialMessages(init_data.accessible_sprites[0]);
           }
         }
         catch (error) {
@@ -226,7 +226,7 @@ export function Assistant() {
                   last_message_id_ref.current = parsedChunk?.id;
                   first_message_ref.current = true;
                 }
-                if (parsedChunk.agent_id === currentThreadIdRef.current && (parsedChunk.name === "send_message" || parsedChunk.name === "log")) {
+                if (parsedChunk.sprite_id === currentThreadIdRef.current && (parsedChunk.name === "send_message" || parsedChunk.name === "log")) {
                   setThreads(prev => {
                     const next = new Map(prev);
                     const current = next.get(currentThreadIdRef.current) || [];
@@ -338,7 +338,7 @@ export function Assistant() {
         body: JSON.stringify({
           "message": message.content,
           "user_name": localStorage.getItem("user_name"),
-          "agent_id": currentThreadId
+          "sprite_id": currentThreadId
         }),
       });
 
