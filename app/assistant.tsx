@@ -226,10 +226,11 @@ export function Assistant() {
                   last_message_id_ref.current = parsedChunk?.id;
                   first_message_ref.current = true;
                 }
-                if (parsedChunk.sprite_id === currentThreadIdRef.current && (parsedChunk.name === "send_message" || parsedChunk.name === "log")) {
+                if (parsedChunk.sprite_id === currentThreadIdRef.current && (parsedChunk.method === "send_message" || parsedChunk?.log)) {
                   setThreads(prev => {
                     const next = new Map(prev);
                     const current = next.get(currentThreadIdRef.current) || [];
+                    const message_content = parsedChunk.method === "send_message" ? parsedChunk.params.content : parsedChunk.log;
 
                     // 如果是新的助手消息
                     if (first_message_ref.current) {
@@ -238,7 +239,7 @@ export function Assistant() {
                         ...current,
                         {
                           role: "assistant",
-                          content: parsedChunk.args.content
+                          content: message_content
                         }
                       ]);
                     }
@@ -252,7 +253,7 @@ export function Assistant() {
                         const updatedCurrent = [...current];
                         updatedCurrent[lastAssistantMessageIndex] = {
                           ...updatedCurrent[lastAssistantMessageIndex],
-                          content: parsedChunk.args.content
+                          content: message_content
                         };
                         return new Map(prev).set(currentThreadIdRef.current, updatedCurrent);
                       }
@@ -263,7 +264,7 @@ export function Assistant() {
                           ...current,
                           {
                             role: "assistant",
-                            content: parsedChunk.args.content
+                            content: message_content
                           }
                         ]);
                       }
