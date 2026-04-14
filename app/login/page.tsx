@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -9,7 +9,10 @@ import bcrypt from "bcryptjs";
 export default function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [userName, setUserName] = useState<string>(localStorage.getItem("user_name") || "");
+  const [userName, setUserName] = useState<string>("");
+  useEffect(() => {
+    setUserName(localStorage.getItem("user_name") || "");
+  }, []);
   const system_regex = new RegExp("system", "i");
   const router = useRouter();
 
