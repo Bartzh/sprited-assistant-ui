@@ -13,8 +13,7 @@ export default function Home() {
       router.push("/login");
       return;
     }
-
-    fetch("/api/verify", {
+    fetch('/api/verify', {
       method: "GET",
       headers: {
         "Authorization": `Bearer ${token}`,

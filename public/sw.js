@@ -4,7 +4,7 @@ self.addEventListener('push', (event) => {
   const options = {
     body: data
   };
-  event.waitUntil(self.registration.showNotification('Become Human', options));
+  event.waitUntil(self.registration.showNotification('Sprited', options));
 });
 
 self.addEventListener('notificationclick', (event) => {

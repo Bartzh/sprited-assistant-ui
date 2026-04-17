@@ -1,5 +1,22 @@
 "use client";
 
+import { Thread } from "@/components/assistant-ui/thread";
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import { ThreadListSidebar } from "@/components/assistant-ui/threadlist-sidebar";
+import { Separator } from "@/components/ui/separator";
+import {
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
+} from "@/components/ui/breadcrumb";
+
 import { useState, useEffect, useRef } from "react";
 import {
   useExternalStoreRuntime,
@@ -8,25 +25,23 @@ import {
   AssistantRuntimeProvider,
   ExternalStoreThreadListAdapter,
   ExternalStoreThreadData,
+  AttachmentAdapter,
 } from "@assistant-ui/react";
-import { Thread } from "@/components/assistant-ui/thread";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
-import { AppSidebar } from "@/components/app-sidebar";
-import { Separator } from "@/components/ui/separator";
-import { Breadcrumb, BreadcrumbItem, BreadcrumbLink, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
+import { encode, decode } from "@msgpack/msgpack";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Bell } from "lucide-react";
-import { fetchEventSource } from '@microsoft/fetch-event-source';
-class RetriableError extends Error { }
-class FatalError extends Error { }
+import { nanoid } from "nanoid";
 
 export function Assistant() {
-  const [ currentThreadId, setCurrentThreadId ] = useState<string>("");
-  const currentThreadIdRef = useRef<string>(currentThreadId); // 使用ref来获取最新的值
-  const first_message_ref = useRef<boolean>(true);
-  const last_message_id_ref = useRef<string>("");
-  const [threads, setThreads] = useState<Map<string, ThreadMessageLike[]>>(
+  const [currentThreadId, setCurrentThreadId] = useState<string>("");
+  const currentThreadIdRef = useRef<string>(currentThreadId);
+  const firstMessageRef = useRef<boolean>(true);
+  const lastMessageIdRef = useRef<string>("");
+  const wsRef = useRef<WebSocket | null>(null);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [connected, setConnected] = useState<boolean>(false);
+  const [threads, setThreads] = useState<Map<string, readonly ThreadMessageLike[]>>(
     new Map()
   );
   const [threadList, setThreadList] = useState<ExternalStoreThreadData<"regular">[]>([]);
@@ -46,51 +61,291 @@ export function Assistant() {
     }
   }, [userName])
 
-  // Get messages for current thread
   const currentMessages = threads.get(currentThreadId) || [];
 
-  const fetchInitialMessages = async (threadId: string) => {
+  const disconnectWebSocket = () => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    setConnected(false);
+  };
+
+  const startHeartbeat = () => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+    }
+    heartbeatRef.current = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(encode({ type: "ping" }));
+      }
+    }, 30000);
+  };
+
+  const handleAuthResult = (data: { status: string; accessible_sprites?: string[]; detail?: string }) => {
+    if (data.status === "success" && data.accessible_sprites) {
+      const newThreads = new Map<string, ThreadMessageLike[]>();
+      const newThreadsList: ExternalStoreThreadData<"regular">[] = [];
+      data.accessible_sprites.forEach((threadId: string) => {
+        newThreads.set(threadId, []);
+        newThreadsList.push({
+          id: threadId,
+          status: "regular",
+          title: threadId,
+        });
+      });
+      setThreadList(newThreadsList);
+      if (data.accessible_sprites.length > 0) {
+        setCurrentThreadId(data.accessible_sprites[0]);
+      }
+    } else if (data.status === "error") {
+      console.error("Auth error:", data.detail);
+    }
+  };
+
+  const handleInit = (data: { sprite_id: string; messages: any[] }) => {
+    if (data.sprite_id !== currentThreadIdRef.current) return;
+
+    function base64ToImageFile(
+      base64String: string, 
+      fileName: string,
+      mimeType: string = 'image/png'
+    ): File {
+      // 1. 清洗并标准化base64字符串
+      const cleanBase64 = base64String
+        .replace(/[\r\n\t\s]/g, '')  // 移除换行空格
+        .replace(/^data:image\/\w+;base64,/, '');  // 移除data:前缀
+
+      // 2. Base64解码
+      let binaryString: string;
+      try {
+        binaryString = atob(cleanBase64);
+      } catch (e) {
+        throw new Error(`Base64解码失败: ${(e as Error).message}`);
+      }
+
+      // 3. 转换为Uint8Array
+      const length = binaryString.length;
+      const bytes = new Uint8Array(length);
+      for (let i = 0; i < length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+
+      // 4. 创建Blob对象（处理浏览器兼容性）
+      let blob = new Blob([bytes], { type: mimeType });
+
+      // 5. 确保MIME类型有效（针对Safari等浏览器）
+      if (!blob.type) {
+        try {
+          // 尝试强制设置type属性
+          Object.defineProperty(blob, 'type', {
+            value: mimeType,
+            writable: false,
+            enumerable: true
+          });
+        } catch (e) {
+          console.warn(`无法设置Blob.type，将依赖文件扩展名: ${(e as Error).message}`);
+        }
+      }
+
+      // 6. 转换为File对象
+      return new File([blob], fileName, { type: blob.type || mimeType });
+    }
+
+    const parsedMessages: ThreadMessageLike[] = (data.messages || [])
+      .filter((msg: any) => ['ai', 'human'].includes(msg.role))
+      .map((msg: { role: string; content: any; id: string; name: string | null }) => {
+        let content: any;
+        let attachments: any[] = [];
+
+        // 处理 content 和 attachments
+        if (typeof msg.content === 'string') {
+          content = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          content = [];
+          for (const contentBlock of msg.content) {
+            if (typeof contentBlock === 'string') {
+              content.push({ type: 'text', text: contentBlock });
+            } else if (contentBlock.type === 'text') {
+              content.push(contentBlock);
+            } else if (contentBlock.type === 'image') {
+              const fileName = 'image_' + nanoid();
+              const file = base64ToImageFile(contentBlock.base64, fileName, contentBlock.mime_type);
+              attachments.push({
+                id: nanoid(),
+                type: 'image',
+                name: fileName,
+                file,
+                content: [{
+                  type: 'image',
+                  image: contentBlock.base64,
+                  filename: fileName,
+                }],
+                status: { type: "complete" },
+              });
+            } else if (['file', 'image', 'audio', 'video', 'text-plain'].includes(contentBlock.type)) {
+              const fileName = 'file_' + nanoid();
+              attachments.push({
+                id: nanoid(),
+                type: 'file',
+                name: fileName,
+                content: [{
+                  type: 'file',
+                  data: contentBlock.base64,
+                  mimeType: contentBlock.mime_type,
+                  filename: fileName,
+                }],
+                status: { type: "complete" },
+              });
+            } else if (contentBlock.type === 'reasoning') {
+              content.push({'type': 'reasoning', 'text': contentBlock.reasoning});
+            }
+          }
+        } else {
+          content = msg.content;
+        }
+
+        return {
+          role: msg.role === "ai" ? "assistant" : "user",
+          content,
+          attachments,
+          id: msg.id,
+          name: msg.name || undefined,
+        };
+      });
+
+    setThreads(prev => {
+      const next = new Map(prev);
+      next.set(data.sprite_id, parsedMessages);
+      return next;
+    });
+  };
+
+  const handleEvent = (data: { event: any }) => {
+    const event = data.event;
+    if (event.id !== undefined && event.id !== lastMessageIdRef.current) {
+      lastMessageIdRef.current = event.id;
+      firstMessageRef.current = true;
+    }
+
+    if (event.sprite_id === currentThreadIdRef.current && (event.method === "send_message" || event.log)) {
+      setThreads(prev => {
+        const next = new Map(prev);
+        const current = next.get(currentThreadIdRef.current) || [];
+        const messageContent = event.method === "send_message" ? event.params?.content : event.log;
+
+        if (firstMessageRef.current) {
+          return new Map(prev).set(currentThreadIdRef.current, [
+            ...current,
+            {
+              role: "assistant",
+              content: messageContent
+            }
+          ]);
+        } else {
+          const lastAssistantMessageIndex = current.map((msg, index) => ({ msg, index }))
+            .filter(({ msg }) => msg.role === "assistant")
+            .pop()?.index;
+
+          if (lastAssistantMessageIndex !== undefined) {
+            const updatedCurrent = [...current];
+            updatedCurrent[lastAssistantMessageIndex] = {
+              ...updatedCurrent[lastAssistantMessageIndex],
+              content: messageContent
+            };
+            return new Map(prev).set(currentThreadIdRef.current, updatedCurrent);
+          } else {
+            return new Map(prev).set(currentThreadIdRef.current, [
+              ...current,
+              {
+                role: "assistant",
+                content: messageContent
+              }
+            ]);
+          }
+        }
+      });
+
+      if (firstMessageRef.current) {
+        firstMessageRef.current = false;
+      }
+      if (!(event.not_completed ?? false)) {
+        firstMessageRef.current = true;
+      }
+    }
+  };
+
+  const connectWebSocket = () => {
     const token = localStorage.getItem("token");
     if (!token) return;
 
-    try {
-      const init_response = await fetch("/api/init", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "Authorization": `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          "sprite_id": threadId
-        }),
-      });
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${window.location.host}/api/ws`;
+    //const wsUrl = "/ws";
 
-      if (!init_response.ok) {
-        throw new Error(`HTTP error! status: ${init_response.status}`);
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setConnected(true);
+      ws.send(encode({ type: "auth", token }));
+      startHeartbeat();
+    };
+
+    ws.onmessage = async (event) => {
+      try {
+        const arrayBuffer = await event.data.arrayBuffer();
+        const data = decode(new Uint8Array(arrayBuffer)) as any;
+        const msgType = data.type;
+
+        if (msgType === "auth_result") {
+          handleAuthResult(data);
+        } else if (msgType === "init") {
+          handleInit(data);
+        } else if (msgType === "event") {
+          handleEvent(data);
+        } else if (msgType === "pong") {
+        } else if (msgType === "error") {
+          console.error("WebSocket error:", data.detail);
+        }
+      } catch (e) {
+        console.warn("Failed to parse WebSocket message:", e);
       }
+    };
 
-      const init_data = await init_response.json();
+    ws.onclose = () => {
+      setConnected(false);
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
+      setTimeout(connectWebSocket, 3000);
+    };
 
-      // 过滤并转换合法的消息
-      const parsedMessages: ThreadMessageLike[] = (init_data.messages || [])
-        .filter((msg: any) =>
-          ['ai', 'human'].includes(msg.role)
-        )
-        .map((msg: { role: string; content: string; id: string; name: string | null }) => ({
-          role: msg.role === "ai" ? "assistant" : "user",
-          content: msg.content,
-          id: msg.id,
-          name: msg.name || undefined,
-        }));
+    ws.onerror = (err) => {
+      console.error("WebSocket error:", err);
+    };
+  };
 
-      setThreads(prev => {
-        const next = new Map(prev);
-        next.set(currentThreadId, parsedMessages);
-        return next;
-      });
+  const sendInit = (spriteId: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(encode({ type: "init", sprite_id: spriteId }));
+    }
+  };
 
-    } catch (error) {
-      console.error("Initialization Error: ", error);
+  const sendMessage = (spriteId: string, message: AppendMessage, userName: string | null) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(encode({
+        type: "message",
+        sprite_id: spriteId,
+        content: message.content,
+        attachments: message.attachments,
+        user_name: userName
+      }));
     }
   };
 
@@ -120,7 +375,7 @@ export function Assistant() {
     onRename: (threadId: string, newTitle: string) => {
       setThreadList((prev) =>
         prev.map((t) =>
-          t.threadId === threadId ? { ...t, title: newTitle } : t
+          t.id === threadId ? { ...t, title: newTitle } : t
         )
       );
     },
@@ -145,177 +400,26 @@ export function Assistant() {
   };
     // 使用 useEffect 来完成初始化
     useEffect(() => {
-      const fetchInitialThreads = async () => {
-        const token = localStorage.getItem("token");
-        if (!token) return;
-
-        try {
-          const init_response = await fetch("/api/get_accessible_sprites", {
-            method: "GET",
-            headers: {
-              "Authorization": `Bearer ${token}`,
-            }
-          });
-
-          if (!init_response.ok) {
-            throw new Error(`HTTP error! status: ${init_response.status}`);
-          }
-
-          const init_data = await init_response.json();
-
-          // 将后端返回的 thread_id 列表转换为 threads Map 结构，每个 thread_id 对应一个空数组
-          const newThreads = new Map<string, ThreadMessageLike[]>();
-          const newTHreadsList: ExternalStoreThreadData<"regular">[] = [];
-          init_data.accessible_sprites.forEach((threadId: string) => {
-            newThreads.set(threadId, []);
-            newTHreadsList.push({
-              "threadId": threadId,
-              "status": "regular",
-              "title": threadId,
-            });
-          });
-
-          // 更新 threads 状态
-          setThreadList(newTHreadsList);
-          //setThreads(newThreads);
-          // 设置当前线程 ID 为最后一个可访问线程（如果存在）
-          if (init_data.accessible_sprites.length > 0) {
-            setCurrentThreadId(init_data.accessible_sprites[0]);
-            //await fetchInitialMessages(init_data.accessible_sprites[0]);
-          }
-        }
-        catch (error) {
-          console.error("Initialization Error: ", error);
-        }
-      }
       setUserName(localStorage.getItem("user_name") ?? "");
-      fetchInitialThreads();
-      const fetchSSE = async () => {
-        let token = localStorage.getItem("token");
-        if (!token) return;
-        let first_message = true;
-        //let buffer = '';
-        let last_id = '';
-        await fetchEventSource('/api/sse', {
-          openWhenHidden: true,
-          method: 'GET',
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Accept": "text/event-stream",
-            "Cache-Control": "no-cache"
-          },
-          async onopen(response) {
-            if (response.status === 401) {
-              token = localStorage.getItem("token");
-            }
-          },
-          onmessage(event) {
-            if (event.event !== "message") {
-              return;
-            }
-            const chunk = event.data;
-            // 在页面上显示消息
-            //buffer += chunk;
-            console.debug(chunk)
-            //const lines = buffer.split('\n');
-            if (chunk.trim()) {
-              try {
-                const parsedChunk = JSON.parse(chunk);
-                //buffer = '';
-                if (parsedChunk?.id !== undefined && parsedChunk?.id !== last_message_id_ref.current) {
-                  last_message_id_ref.current = parsedChunk?.id;
-                  first_message_ref.current = true;
-                }
-                if (parsedChunk.sprite_id === currentThreadIdRef.current && (parsedChunk.method === "send_message" || parsedChunk?.log)) {
-                  setThreads(prev => {
-                    const next = new Map(prev);
-                    const current = next.get(currentThreadIdRef.current) || [];
-                    const message_content = parsedChunk.method === "send_message" ? parsedChunk.params.content : parsedChunk.log;
+      connectWebSocket();
+      return () => {
+        disconnectWebSocket();
+      };
+    }, []);
 
-                    // 如果是新的助手消息
-                    if (first_message_ref.current) {
-                      //first_message_ref.current = false;
-                      return new Map(prev).set(currentThreadIdRef.current, [
-                        ...current,
-                        {
-                          role: "assistant",
-                          content: message_content
-                        }
-                      ]);
-                    }
-                    else {
-                      // 只更新最后一条 role 为 assistant 的消息
-                      const lastAssistantMessageIndex = current.map((msg, index) => ({ msg, index }))
-                        .filter(({ msg }) => msg.role === "assistant")
-                        .pop()?.index;
-
-                      if (lastAssistantMessageIndex !== undefined) {
-                        const updatedCurrent = [...current];
-                        updatedCurrent[lastAssistantMessageIndex] = {
-                          ...updatedCurrent[lastAssistantMessageIndex],
-                          content: message_content
-                        };
-                        return new Map(prev).set(currentThreadIdRef.current, updatedCurrent);
-                      }
-
-                      else {
-                        // 如果没有找到 assistant 消息，则添加新消息
-                        return new Map(prev).set(currentThreadIdRef.current, [
-                          ...current,
-                          {
-                            role: "assistant",
-                            content: message_content
-                          }
-                        ]);
-                      }
-                    }
-                  });
-                  if (first_message_ref.current) {
-                    first_message_ref.current = false;
-                  }
-                  if (!(parsedChunk.not_completed ?? false)) {
-                    first_message_ref.current = true;
-                  }
-                }
-              } catch (e) {
-                //buffer = line;
-                console.warn('onmessage error: ', e);
-                //continue;
-              }
-            }
-          },
-          onclose() {
-            console.log('SSE connection closed');
-            // 正常关闭连接，等待一段时间后重连
-            setTimeout(() => {
-              throw new RetriableError();
-            }, 3000);
-          },
-          onerror(err) {
-            console.error('SSE error:', err);
-          }
-        });
-      }
-      fetchSSE();
-    }, []); // 空依赖数组表示只在组件挂载时运行一次
-
-    // 新增useEffect监听currentThreadId变化
     useEffect(() => {
-      /*if (currentThreadId && !threads.has(currentThreadId)) {
-        fetchInitialMessages(currentThreadId);
-      }*/
       if (currentThreadId) {
-        fetchInitialMessages(currentThreadId);
+        sendInit(currentThreadId);
       }
     }, [currentThreadId]);
 
   const onNew = async (message: AppendMessage) => {
-    const token = localStorage.getItem("token");
-    if (!token) return;
-    // Add user message
+    console.log(message.attachments);
+    console.log(message.content);
     const userMessage: ThreadMessageLike = {
       role: "user",
       content: message.content,
+      attachments: message.attachments,
     };
     setThreads(prev => {
       const next = new Map(prev);
@@ -324,113 +428,59 @@ export function Assistant() {
       return next;
     });
 
-    // Generate response
-    //setIsRunning(true);
+    sendMessage(currentThreadId, message, localStorage.getItem("user_name"));
+  };
 
 
-    try {
-      // 发送HTTP请求
-      const response = await fetch("/api/input", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          "message": message.content,
-          "user_name": localStorage.getItem("user_name"),
-          "sprite_id": currentThreadId
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-    }
-
-      // 创建一个ReadableStream来处理响应数据
-      /*const reader = response.body?.getReader();
-
-      if (!reader) {
-        throw new Error('Failed to get reader from response body');
-      }
-
-      const decoder = new TextDecoder('utf-8');
-      let first_message = true
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          break;
-        }
-
-        // 将接收到的数据转换为object
-        const chunk = decoder.decode(value, { stream: true });
-        buffer += chunk;
-        console.debug(buffer)
-        const lines = buffer.split('\n');
-        for (const line of lines) {
-          if (line.trim()) {
-            let parsedChunk: any;
-            try {
-              parsedChunk = JSON.parse(line);
-              buffer = '';
-            } catch (e) {
-              buffer = line;
-              console.warn('Failed to parse chunk as JSON, trying to use buffer:', e);
-              continue;
-            }
-
-            if (parsedChunk.name === "send_message" || parsedChunk.name === "log") {
-              setThreads(prev => {
-                const next = new Map(prev);
-                const current = next.get(currentThreadId) || [];
-                const lastMessage = current[current.length - 1];
-                // 如果是新的助手消息
-                if (first_message) {
-                  first_message = false;
-                  return new Map(prev).set(currentThreadId, [
-                    ...current,
-                    {
-                      role: "assistant",
-                      content: parsedChunk.args.content
-                    }
-                  ]);
-                }
-                else {
-                  return new Map(prev).set(currentThreadId, [
-                    ...current.slice(0, -1),
-                    {
-                      ...lastMessage,
-                      content: lastMessage.content + parsedChunk.args.content
-                    }
-                  ]);
-                }
-              });
-              if (!(parsedChunk.not_completed ?? false)) {
-                first_message = true;
-              }
-            }
-          }
-        }
-      }
-    } */catch (error) {
-      console.error("Unexpected Error: ", error);
-      const errorMessage: ThreadMessageLike = {
-        role: "assistant",
-        content: `Error: ${String(error)}`,
+  function bytesToBase64(bytes: Uint8Array): string {
+    const binString = Array.from(bytes, (byte) => 
+      String.fromCodePoint(byte)
+    ).join("");
+    return btoa(binString);
+  }
+  const attachmentAdapter: AttachmentAdapter = {
+    accept: "image/*,application/pdf,.txt,.md",
+    async add({ file }) {
+      // Upload file to your server
+      console.log("add attachment", file);
+      // const formData = new FormData();
+      // formData.append("file", file);
+      // const response = await fetch("/api/upload", {
+      //   method: "POST",
+      //   body: formData,
+      // });
+      // const { id } = await response.json();
+      const type = file.type.split('/')[0];
+      return {
+        id: nanoid(),
+        type: type === "image" ? "image" : "file",
+        name: file.name,
+        mime_type: file.type,
+        size: file.size,
+        file,
+        status: { type: "requires-action", reason: "composer-send" },
       };
-      setThreads(prev => {
-        const next = new Map(prev);
-        const current = next.get(currentThreadId) || [];
-        next.set(currentThreadId, [...current, errorMessage]);
-        return next;
-      });
-    }/* finally {
-      setIsRunning(false);
-    }*/
+    },
+    async remove(attachment) {
+      // Remove file from server
+      console.log("remove attachment", attachment);
+      // await fetch(`/api/upload/${attachment.id}`, {
+      //   method: "DELETE",
+      // });
+    },
+    async send(attachment) {
+      // Convert pending attachment to complete attachment when message is sent
+      console.log("send attachment", attachment);
+      const type = attachment.file.type.split('/')[0];
+      const arrayBuffer = await attachment.file.bytes();
+      return {
+        ...attachment,
+        status: { type: "complete" },
+        // langchain content block
+        content: [{ type: type, base64: bytesToBase64(arrayBuffer), mime_type: attachment.file.type, id: attachment.id }],
+      // fuck type checking
+      } as any;
+    },
   };
 
 
@@ -444,7 +494,8 @@ export function Assistant() {
     onNew,
     convertMessage: (message) => message,
     adapters: {
-      threadList: threadListAdapter
+      threadList: threadListAdapter,
+      attachments: attachmentAdapter,
     }
   });
 
@@ -501,46 +552,61 @@ export function Assistant() {
     }
   }
 
+
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SidebarProvider>
-        <AppSidebar />
-        <SidebarInset>
-          <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
-            <SidebarTrigger />
-            <Separator orientation="vertical" className="mr-2 h-4" />
-            <Breadcrumb>
-              <BreadcrumbList>
-                <BreadcrumbItem className="hidden md:block">
-                  <BreadcrumbPage>
-                    BecomeHuman
-                  </BreadcrumbPage>
-                </BreadcrumbItem>
-                <BreadcrumbSeparator className="hidden md:block" />
-                <BreadcrumbItem>
-                  <Input
-                    placeholder="你的名字"
-                    value={userName}
-                    //value={localStorage.getItem("user_name") ?? ""}
-                    onChange={(e) => setUserName(e.target.value)}
-                    //onChange={(e) => localStorage.setItem("user_name", e.target.value)}
-                  />
-                </BreadcrumbItem>
-                <BreadcrumbItem>
-                  <Button
-                    variant="outline"
-                    size="icon"
-                    onClick={registerServiceWorker}
-                  >
-                    <Bell className="h-4 w-4" />
-                    <span className="sr-only">开启通知</span>
-                  </Button>
-                </BreadcrumbItem>
-              </BreadcrumbList>
-            </Breadcrumb>
-          </header>
-          <Thread />
-        </SidebarInset>
+        <div className="flex h-dvh w-full pr-0.5">
+          <ThreadListSidebar />
+          <SidebarInset>
+            <header className="flex h-16 shrink-0 items-center gap-2 border-b px-4">
+              <SidebarTrigger />
+              <Separator orientation="vertical" className="mr-2 h-4" />
+              <Breadcrumb>
+                <BreadcrumbList>
+                  <BreadcrumbItem className="hidden md:block">
+                    <BreadcrumbLink
+                      href="https://github.com/Bartzh/sprited"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      sprited
+                    </BreadcrumbLink>
+                  </BreadcrumbItem>
+                  {/* <BreadcrumbSeparator className="hidden md:block" />
+                  <BreadcrumbItem className="hidden md:block">
+                    <BreadcrumbPage>
+                      sprited
+                    </BreadcrumbPage>
+                  </BreadcrumbItem> */}
+                  <BreadcrumbSeparator className="hidden md:block" />
+                  <BreadcrumbItem>
+                    <Input
+                      placeholder="你的名字"
+                      value={userName}
+                      //value={localStorage.getItem("user_name") ?? ""}
+                      onChange={(e) => setUserName(e.target.value)}
+                      //onChange={(e) => localStorage.setItem("user_name", e.target.value)}
+                    />
+                  </BreadcrumbItem>
+                  <BreadcrumbItem>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      onClick={registerServiceWorker}
+                    >
+                      <Bell className="h-4 w-4" />
+                      <span className="sr-only">开启通知</span>
+                    </Button>
+                  </BreadcrumbItem>
+                </BreadcrumbList>
+              </Breadcrumb>
+            </header>
+            <div className="flex-1 overflow-hidden">
+              <Thread />
+            </div>
+          </SidebarInset>
+        </div>
       </SidebarProvider>
     </AssistantRuntimeProvider>
   );
